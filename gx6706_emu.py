@@ -287,7 +287,7 @@ def _mmio_read32(phys, state, mmio_low_u32, mmio_vpu_u32, flash):
 
 
 @njit( cache=True )
-def _ga_exec_cmds(val, state, dram, dram_u32, mmio_vpu_u32, mmio_log):
+def _ga_exec_cmds(val, state, dram, dram_u16, dram_u32, mmio_vpu_u32, mmio_log):
     prev = mmio_vpu_u32[(0x00700018) >> 2]
     if (val & np.uint32(0x10000)) != 0 and (prev & np.uint32(0x10000)) == 0:
         cmd_cnt = val & np.uint32(0xffff)
@@ -319,14 +319,22 @@ def _ga_exec_cmds(val, state, dram, dram_u32, mmio_vpu_u32, mmio_log):
             if (w0 & np.uint32(0x80000000)) == 0 and (w0 & np.uint32(0x10000000)) != 0:
                 # FillRect
                 color = w8
-                c_lo = np.uint8(color & np.uint32(0xff))
-                c_hi = np.uint8((color >> np.uint32(8)) & np.uint32(0xff))
-                for y in range(dst_h):
-                    row_off = dst_base + (y * dst_pitch) * (4 if dst_fmt == 7 else 2)
-                    if dst_fmt == 7:
-                        for x in range(dst_w):
-                            dram_u32[(row_off >> 2) + x] = color
-                    else:
+                if dst_fmt == 7:
+                    d_base32 = dst_base >> 2
+                    for y in range(dst_h):
+                        r32 = d_base32 + y * dst_pitch
+                        dram_u32[r32 : r32 + dst_w] = color
+                elif (dst_base & 1) == 0:
+                    color16 = np.uint16(color & np.uint32(0xffff))
+                    d_base16 = dst_base >> 1
+                    for y in range(dst_h):
+                        r16 = d_base16 + y * dst_pitch
+                        dram_u16[r16 : r16 + dst_w] = color16
+                else:
+                    c_lo = np.uint8(color & np.uint32(0xff))
+                    c_hi = np.uint8((color >> np.uint32(8)) & np.uint32(0xff))
+                    for y in range(dst_h):
+                        row_off = dst_base + (y * dst_pitch) * 2
                         for x in range(dst_w):
                             p = row_off + (x << 1)
                             dram[p] = c_lo
@@ -341,25 +349,50 @@ def _ga_exec_cmds(val, state, dram, dram_u32, mmio_vpu_u32, mmio_log):
                 ckey_en = (w0 & np.uint32(0x00100000)) != 0
                 ckey = w8 & np.uint32(0xffff)
                 if src_w > 0 and src_h > 0:
-                    for y in range(dst_h):
-                        sy = (y * src_h) // dst_h
-                        s_row = src_base + (sy * src_pitch) * (4 if src_fmt == 7 else 2)
-                        d_row = dst_base + (y * dst_pitch) * (4 if dst_fmt == 7 else 2)
-                        for x in range(dst_w):
-                            sx = (x * src_w) // dst_w
-                            if src_fmt == 7:
-                                pix = dram_u32[(s_row >> 2) + sx]
-                            else:
-                                sp = s_row + (sx << 1)
-                                pix = np.uint32(dram[sp]) | (np.uint32(dram[sp + 1]) << np.uint32(8))
-                            if ckey_en and (pix & np.uint32(0xffff)) == ckey:
-                                continue
-                            if dst_fmt == 7:
-                                dram_u32[(d_row >> 2) + x] = pix
-                            else:
-                                dp = d_row + (x << 1)
-                                dram[dp] = np.uint8(pix & np.uint32(0xff))
-                                dram[dp + 1] = np.uint8((pix >> np.uint32(8)) & np.uint32(0xff))
+                    if src_w == dst_w and src_h == dst_h and src_fmt != 7 and dst_fmt != 7 and (src_base & 1) == 0 and (dst_base & 1) == 0:
+                        s_base16 = src_base >> 1
+                        d_base16 = dst_base >> 1
+                        if not ckey_en:
+                            for y in range(dst_h):
+                                s16 = s_base16 + y * src_pitch
+                                d16 = d_base16 + y * dst_pitch
+                                dram_u16[d16 : d16 + dst_w] = dram_u16[s16 : s16 + dst_w]
+                        else:
+                            ckey16 = np.uint16(ckey)
+                            for y in range(dst_h):
+                                s16 = s_base16 + y * src_pitch
+                                d16 = d_base16 + y * dst_pitch
+                                for x in range(dst_w):
+                                    pix16 = dram_u16[s16 + x]
+                                    if pix16 != ckey16:
+                                        dram_u16[d16 + x] = pix16
+                    elif src_w == dst_w and src_h == dst_h and src_fmt == 7 and dst_fmt == 7 and not ckey_en:
+                        s_base32 = src_base >> 2
+                        d_base32 = dst_base >> 2
+                        for y in range(dst_h):
+                            s32 = s_base32 + y * src_pitch
+                            d32 = d_base32 + y * dst_pitch
+                            dram_u32[d32 : d32 + dst_w] = dram_u32[s32 : s32 + dst_w]
+                    else:
+                        for y in range(dst_h):
+                            sy = (y * src_h) // dst_h
+                            s_row = src_base + (sy * src_pitch) * (4 if src_fmt == 7 else 2)
+                            d_row = dst_base + (y * dst_pitch) * (4 if dst_fmt == 7 else 2)
+                            for x in range(dst_w):
+                                sx = (x * src_w) // dst_w
+                                if src_fmt == 7:
+                                    pix = dram_u32[(s_row >> 2) + sx]
+                                else:
+                                    sp = s_row + (sx << 1)
+                                    pix = np.uint32(dram[sp]) | (np.uint32(dram[sp + 1]) << np.uint32(8))
+                                if ckey_en and (pix & np.uint32(0xffff)) == ckey:
+                                    continue
+                                if dst_fmt == 7:
+                                    dram_u32[(d_row >> 2) + x] = pix
+                                else:
+                                    dp = d_row + (x << 1)
+                                    dram[dp] = np.uint8(pix & np.uint32(0xff))
+                                    dram[dp + 1] = np.uint8((pix >> np.uint32(8)) & np.uint32(0xff))
 
             off += np.uint32(80)
             if buf_sz > np.uint32(0) and off >= buf_sz:
@@ -618,7 +651,7 @@ def _read8(addr, state, dram, mmio_low, mmio_low_u32, mmio_vpu_u32, flash):
 
 
 @njit( cache=True )
-def _write32(addr, val_in, state, dram, dram_u32, mmio_low, mmio_low_u32, mmio_vpu_u32, uart_buf, mmio_log):
+def _write32(addr, val_in, state, dram, dram_u16, dram_u32, mmio_low, mmio_low_u32, mmio_vpu_u32, uart_buf, mmio_log):
     phys = np.uint32(addr) & np.uint32(0x1fffffff)
     val = np.uint32(val_in)
     if 0x10000000 <= phys < 0x14000000:
@@ -641,7 +674,7 @@ def _write32(addr, val_in, state, dram, dram_u32, mmio_low, mmio_low_u32, mmio_v
             mmio_low[phys + 3] = np.uint8((val >> 24) & 0xff)
         return
     if phys == 0x04700018:
-        _ga_exec_cmds(val, state, dram, dram_u32, mmio_vpu_u32, mmio_log)
+        _ga_exec_cmds(val, state, dram, dram_u16, dram_u32, mmio_vpu_u32, mmio_log)
     _mmio_write32(phys, val, state, mmio_low_u32, mmio_vpu_u32, uart_buf, mmio_log)
 
 
@@ -797,7 +830,6 @@ def run_cpu(
                 state[ST_STOP_REASON] = STOP_PC_OOB
                 break
 
-        state[ST_LAST_PC] = pc
         next_pc = np.uint32(pc + np.uint32(2))
         insn_count += np.uint64(1)
 
@@ -806,520 +838,540 @@ def run_cpu(
         ry = np.uint32((inst >> 4) & 0xf)
         rz = np.uint32((inst >> 8) & 0xf)
 
-        if op == 0x0:
-            if rz == 0x0:
-                if ry == 0x0:
-                    if inst == 0x0000:  # bkpt
-                        state[ST_PC] = pc
-                        state[ST_STOP_REASON] = STOP_BKPT
-                        break
-                    elif inst == 0x0001:  # sync
-                        pass
-                    elif inst == 0x0002:  # rte
-                        cr[0] = cr[2]
-                        c_flag = np.uint32(cr[0] & np.uint32(1))
-                        next_pc = np.uint32(cr[4] & np.uint32(0xfffffffe))
-                    elif inst == 0x0003:  # rfi
-                        cr[0] = cr[3]
-                        c_flag = np.uint32(cr[0] & np.uint32(1))
-                        next_pc = np.uint32(cr[5] & np.uint32(0xfffffffe))
-                    elif inst == 0x0004 or inst == 0x0005 or inst == 0x0006:
-                        pass
-                    elif inst == 0x0007:
-                        pass
-                    elif 0x0008 <= inst <= 0x000b:  # trap 0..3
-                        vec = np.uint32(16 + (inst & 3))
-                        cr[0] = np.uint32((cr[0] & np.uint32(0xfffffffe)) | (c_flag & np.uint32(1)))
-                        cr[2] = cr[0]
-                        cr[4] = next_pc
-                        cr[0] = np.uint32((cr[0] & np.uint32(0xff80feaf)) | np.uint32(0x80000000) | (vec << np.uint32(16)))
-                        c_flag = np.uint32(cr[0] & np.uint32(1))
-                        next_pc = np.uint32(_read32(np.uint32(cr[1] + (vec << np.uint32(2))), state, dram, dram_u32, mmio_low, mmio_low_u32, mmio_vpu_u32, flash) & np.uint32(0xfffffffe))
-                elif ry == 0x1:  # cpseti
-                    pass
-                elif ry == 0x2:  # mvc rx
-                    regs[rx] = np.uint32(c_flag & np.uint32(1))
-                elif ry == 0x3:  # mvcv rx
-                    regs[rx] = np.uint32((c_flag ^ np.uint32(1)) & np.uint32(1))
-                elif ry == 0x4:  # ldq r4-r7, (rx)
-                    base_addr = regs[rx]
-                    r4 = _read32(base_addr, state, dram, dram_u32, mmio_low, mmio_low_u32, mmio_vpu_u32, flash)
-                    r5 = _read32(np.uint32(base_addr + np.uint32(4)), state, dram, dram_u32, mmio_low, mmio_low_u32, mmio_vpu_u32, flash)
-                    r6 = _read32(np.uint32(base_addr + np.uint32(8)), state, dram, dram_u32, mmio_low, mmio_low_u32, mmio_vpu_u32, flash)
-                    r7 = _read32(np.uint32(base_addr + np.uint32(12)), state, dram, dram_u32, mmio_low, mmio_low_u32, mmio_vpu_u32, flash)
-                    regs[4] = r4
-                    regs[5] = r5
-                    regs[6] = r6
-                    regs[7] = r7
-                elif ry == 0x5:  # stq r4-r7, (rx)
-                    base_addr = regs[rx]
-                    _write32(base_addr, regs[4], state, dram, dram_u32, mmio_low, mmio_low_u32, mmio_vpu_u32, uart_buf, mmio_log)
-                    _write32(np.uint32(base_addr + np.uint32(4)), regs[5], state, dram, dram_u32, mmio_low, mmio_low_u32, mmio_vpu_u32, uart_buf, mmio_log)
-                    _write32(np.uint32(base_addr + np.uint32(8)), regs[6], state, dram, dram_u32, mmio_low, mmio_low_u32, mmio_vpu_u32, uart_buf, mmio_log)
-                    _write32(np.uint32(base_addr + np.uint32(12)), regs[7], state, dram, dram_u32, mmio_low, mmio_low_u32, mmio_vpu_u32, uart_buf, mmio_log)
-                elif ry == 0x6:  # ldm rf-r15, (r0)
-                    base_addr = regs[0]
-                    offset = np.uint32(0)
-                    for r_idx in range(rx, 16):
-                        regs[r_idx] = _read32(np.uint32(base_addr + offset), state, dram, dram_u32, mmio_low, mmio_low_u32, mmio_vpu_u32, flash)
-                        offset = np.uint32(offset + np.uint32(4))
-                elif ry == 0x7:  # stm rf-r15, (r0)
-                    base_addr = regs[0]
-                    offset = np.uint32(0)
-                    for r_idx in range(rx, 16):
-                        _write32(np.uint32(base_addr + offset), regs[r_idx], state, dram, dram_u32, mmio_low, mmio_low_u32, mmio_vpu_u32, uart_buf, mmio_log)
-                        offset = np.uint32(offset + np.uint32(4))
-                elif ry == 0x8:  # dect rx
-                    if c_flag != 0:
-                        regs[rx] = np.uint32(regs[rx] - np.uint32(1))
-                elif ry == 0x9:  # decf rx
-                    if c_flag == 0:
-                        regs[rx] = np.uint32(regs[rx] - np.uint32(1))
-                elif ry == 0xa:  # inct rx
-                    if c_flag != 0:
-                        regs[rx] = np.uint32(regs[rx] + np.uint32(1))
-                elif ry == 0xb:  # incf rx
-                    if c_flag == 0:
-                        regs[rx] = np.uint32(regs[rx] + np.uint32(1))
-                elif ry == 0xc:  # jmp rx
-                    next_pc = np.uint32(regs[rx] & np.uint32(0xfffffffe))
-                elif ry == 0xd:  # jsr rx
-                    target = np.uint32(regs[rx] & np.uint32(0xfffffffe))
-                    regs[15] = next_pc
-                    next_pc = target
-                elif ry == 0xe:  # ff1 rx
-                    regs[rx] = _ff1_32(regs[rx])
-                elif ry == 0xf:  # brev rx
-                    regs[rx] = _brev32(regs[rx])
-            elif rz == 0x1:
-                v = regs[rx]
-                if ry == 0x0:  # xtrb3 r1, rx
-                    regs[1] = np.uint32(v & np.uint32(0xff))
-                elif ry == 0x1:  # xtrb2 r1, rx
-                    regs[1] = np.uint32((v >> np.uint32(8)) & np.uint32(0xff))
-                elif ry == 0x2:  # xtrb1 r1, rx
-                    regs[1] = np.uint32((v >> np.uint32(16)) & np.uint32(0xff))
-                elif ry == 0x3:  # xtrb0 r1, rx
-                    regs[1] = np.uint32((v >> np.uint32(24)) & np.uint32(0xff))
-                elif ry == 0x4:  # zextb rx
-                    regs[rx] = np.uint32(v & np.uint32(0xff))
-                elif ry == 0x5:  # sextb rx
-                    b = np.uint32(v & np.uint32(0xff))
-                    regs[rx] = np.uint32(b | np.uint32(0xffffff00)) if (b & np.uint32(0x80)) != 0 else b
-                elif ry == 0x6:  # zexth rx
-                    regs[rx] = np.uint32(v & np.uint32(0xffff))
-                elif ry == 0x7:  # sexth rx
-                    h = np.uint32(v & np.uint32(0xffff))
-                    regs[rx] = np.uint32(h | np.uint32(0xffff0000)) if (h & np.uint32(0x8000)) != 0 else h
-                elif ry == 0x8:  # declt rx
-                    v2 = np.uint32(v - np.uint32(1))
-                    regs[rx] = v2
-                    c_flag = np.uint32(1) if (v2 & np.uint32(0x80000000)) != 0 else np.uint32(0)
-                elif ry == 0x9:  # tstnbz rx
-                    b0 = v & np.uint32(0xff)
-                    b1 = (v >> np.uint32(8)) & np.uint32(0xff)
-                    b2 = (v >> np.uint32(16)) & np.uint32(0xff)
-                    b3 = (v >> np.uint32(24)) & np.uint32(0xff)
-                    c_flag = np.uint32(1) if (b0 != 0 and b1 != 0 and b2 != 0 and b3 != 0) else np.uint32(0)
-                elif ry == 0xa:  # decgt rx
-                    v2 = np.uint32(v - np.uint32(1))
-                    regs[rx] = v2
-                    c_flag = np.uint32(1) if np.int32(v2) > 0 else np.uint32(0)
-                elif ry == 0xb:  # decne rx
-                    v2 = np.uint32(v - np.uint32(1))
-                    regs[rx] = v2
-                    c_flag = np.uint32(1) if v2 != 0 else np.uint32(0)
-                elif ry == 0xc:  # clrt rx
-                    if c_flag != 0:
-                        regs[rx] = np.uint32(0)
-                elif ry == 0xd:  # clrf rx
-                    if c_flag == 0:
-                        regs[rx] = np.uint32(0)
-                elif ry == 0xe:  # abs rx
-                    if (v & np.uint32(0x80000000)) != 0:
-                        regs[rx] = np.uint32(np.uint32(0) - v)
-                elif ry == 0xf:  # not rx
-                    regs[rx] = np.uint32(~v)
-            elif rz == 0x2:  # movt rx, ry
-                if c_flag != 0:
-                    regs[rx] = regs[ry]
-            elif rz == 0x3:  # mult rx, ry
-                prod = np.uint64(regs[rx]) * np.uint64(regs[ry])
-                regs[rx] = np.uint32(prod & np.uint64(0xffffffff))
-                lo = np.uint32(prod & np.uint64(0xffffffff))
-                hi = np.uint32(prod >> np.uint64(32))
-            elif rz == 0x4:  # mac rx, ry
-                regs[rx] = np.uint32(regs[rx] + regs[ry] * regs[1])
-            elif rz == 0x5:  # subu rx, ry
-                regs[rx] = np.uint32(regs[rx] - regs[ry])
-            elif rz == 0x6:  # addc rx, ry
-                s = np.uint64(regs[rx]) + np.uint64(regs[ry]) + np.uint64(c_flag)
-                regs[rx] = np.uint32(s & np.uint64(0xffffffff))
-                c_flag = np.uint32((s >> np.uint64(32)) & np.uint64(1))
-            elif rz == 0x7:  # subc rx, ry
-                borrow = np.int64(1) - np.int64(c_flag)
-                diff = np.int64(regs[rx]) - np.int64(regs[ry]) - borrow
-                regs[rx] = np.uint32(diff & np.int64(0xffffffff))
-                c_flag = np.uint32(1) if diff >= 0 else np.uint32(0)
-            elif rz == 0xa:  # movf rx, ry
-                if c_flag == 0:
-                    regs[rx] = regs[ry]
-            elif rz == 0xb:  # lsr rx, ry
-                sh = np.uint32(regs[ry] & np.uint32(0x3f))
-                regs[rx] = np.uint32(regs[rx] >> sh) if sh < 32 else np.uint32(0)
-            elif rz == 0xc:  # cmphs rx, ry
-                c_flag = np.uint32(1) if regs[rx] >= regs[ry] else np.uint32(0)
-            elif rz == 0xd:  # cmplt rx, ry
-                c_flag = np.uint32(1) if np.int32(regs[rx]) < np.int32(regs[ry]) else np.uint32(0)
-            elif rz == 0xe:  # tst rx, ry
-                c_flag = np.uint32(1) if (regs[rx] & regs[ry]) != 0 else np.uint32(0)
-            elif rz == 0xf:  # cmpne rx, ry
-                c_flag = np.uint32(1) if regs[rx] != regs[ry] else np.uint32(0)
-
-        elif op == 0x1:
-            if rz == 0x0 or rz == 0x1:
-                if (inst & 0xfff8) == 0x11f0:  # psrclr imm3
-                    imm3 = np.uint32(inst & 7)
-                    if imm3 == 0:
-                        cr[0] = np.uint32(cr[0] & ~np.uint32(0x02))
-                    else:
-                        mask = np.uint32(((imm3 & 1) << 6) | (((imm3 >> 1) & 1) << 4) | (((imm3 >> 2) & 1) << 8))
-                        cr[0] = np.uint32(cr[0] & ~mask)
-                elif (inst & 0xfff8) == 0x11f8:  # psrset imm3
-                    imm3 = np.uint32(inst & 7)
-                    if imm3 == 0:
-                        cr[0] = np.uint32(cr[0] | np.uint32(0x02))
-                    else:
-                        mask = np.uint32(((imm3 & 1) << 6) | (((imm3 >> 1) & 1) << 4) | (((imm3 >> 2) & 1) << 8))
-                        cr[0] = np.uint32(cr[0] | mask)
-                else:  # mfcr rx, cr[imm5]
-                    imm5 = np.uint32((inst >> 4) & 0x1f)
-                    if imm5 == 0:
-                        cr[0] = np.uint32((cr[0] & np.uint32(0xfffffffe)) | (c_flag & np.uint32(1)))
-                    regs[rx] = cr[imm5]
-            elif rz == 0x8 or rz == 0x9:  # mtcr rx, cr[imm5]
-                imm5 = np.uint32((inst >> 4) & 0x1f)
-                cr[imm5] = regs[rx]
-                if imm5 == 0:
-                    c_flag = np.uint32(cr[0] & np.uint32(1))
-            elif rz == 0x2:  # mov rx, ry
-                regs[rx] = regs[ry]
-            elif rz == 0x3:  # bgenr rx, ry
-                regs[rx] = np.uint32(np.uint32(1) << (regs[ry] & np.uint32(0x1f)))
-            elif rz == 0x4:  # rsub rx, ry
-                regs[rx] = np.uint32(regs[ry] - regs[rx])
-            elif rz == 0x5:  # ixw rx, ry
-                regs[rx] = np.uint32(regs[rx] + (regs[ry] << np.uint32(2)))
-            elif rz == 0x6:  # and rx, ry
-                regs[rx] = np.uint32(regs[rx] & regs[ry])
-            elif rz == 0x7:  # xor rx, ry
-                regs[rx] = np.uint32(regs[rx] ^ regs[ry])
-            elif rz == 0xa:  # asr rx, ry
-                sh = np.uint32(regs[ry] & np.uint32(0x3f))
-                if sh >= 32:
-                    regs[rx] = np.uint32(0xffffffff) if (regs[rx] & np.uint32(0x80000000)) != 0 else np.uint32(0)
+        if op < 0x8:
+            if op < 0x4:
+                if op < 0x2:
+                    if op == 0x0:
+                        if rz == 0x0:
+                            if ry == 0x0:
+                                if inst == 0x0000:  # bkpt
+                                    state[ST_PC] = pc
+                                    state[ST_STOP_REASON] = STOP_BKPT
+                                    break
+                                elif inst == 0x0001:  # sync
+                                    pass
+                                elif inst == 0x0002:  # rte
+                                    cr[0] = cr[2]
+                                    c_flag = np.uint32(cr[0] & np.uint32(1))
+                                    next_pc = np.uint32(cr[4] & np.uint32(0xfffffffe))
+                                elif inst == 0x0003:  # rfi
+                                    cr[0] = cr[3]
+                                    c_flag = np.uint32(cr[0] & np.uint32(1))
+                                    next_pc = np.uint32(cr[5] & np.uint32(0xfffffffe))
+                                elif 0x0008 <= inst <= 0x000b:  # trap 0..3
+                                    vec = np.uint32(16 + (inst & 3))
+                                    cr[0] = np.uint32((cr[0] & np.uint32(0xfffffffe)) | (c_flag & np.uint32(1)))
+                                    cr[2] = cr[0]
+                                    cr[4] = next_pc
+                                    cr[0] = np.uint32((cr[0] & np.uint32(0xff80feaf)) | np.uint32(0x80000000) | (vec << np.uint32(16)))
+                                    c_flag = np.uint32(cr[0] & np.uint32(1))
+                                    next_pc = np.uint32(_read32(np.uint32(cr[1] + (vec << np.uint32(2))), state, dram, dram_u32, mmio_low, mmio_low_u32, mmio_vpu_u32, flash) & np.uint32(0xfffffffe))
+                            elif ry == 0xc:  # jmp rx
+                                next_pc = np.uint32(regs[rx] & np.uint32(0xfffffffe))
+                            elif ry == 0xd:  # jsr rx
+                                target = np.uint32(regs[rx] & np.uint32(0xfffffffe))
+                                regs[15] = next_pc
+                                next_pc = target
+                            elif ry == 0x6:  # ldm rf-r15, (r0)
+                                base_addr = regs[0]
+                                if (base_addr & np.uint32(0xdc000003)) == np.uint32(0x90000000):
+                                    w_idx = (base_addr & np.uint32(0x03ffffff)) >> np.uint32(2)
+                                    for r_idx in range(rx, 16):
+                                        regs[r_idx] = dram_u32[w_idx]
+                                        w_idx += np.uint32(1)
+                                else:
+                                    offset = np.uint32(0)
+                                    for r_idx in range(rx, 16):
+                                        regs[r_idx] = _read32(np.uint32(base_addr + offset), state, dram, dram_u32, mmio_low, mmio_low_u32, mmio_vpu_u32, flash)
+                                        offset = np.uint32(offset + np.uint32(4))
+                            elif ry == 0x7:  # stm rf-r15, (r0)
+                                base_addr = regs[0]
+                                if (base_addr & np.uint32(0xdc000003)) == np.uint32(0x90000000):
+                                    w_idx = (base_addr & np.uint32(0x03ffffff)) >> np.uint32(2)
+                                    for r_idx in range(rx, 16):
+                                        dram_u32[w_idx] = regs[r_idx]
+                                        w_idx += np.uint32(1)
+                                else:
+                                    offset = np.uint32(0)
+                                    for r_idx in range(rx, 16):
+                                        _write32(np.uint32(base_addr + offset), regs[r_idx], state, dram, dram_u16, dram_u32, mmio_low, mmio_low_u32, mmio_vpu_u32, uart_buf, mmio_log)
+                                        offset = np.uint32(offset + np.uint32(4))
+                            elif ry == 0x2:  # mvc rx
+                                regs[rx] = np.uint32(c_flag & np.uint32(1))
+                            elif ry == 0x3:  # mvcv rx
+                                regs[rx] = np.uint32((c_flag ^ np.uint32(1)) & np.uint32(1))
+                            elif ry == 0x4:  # ldq r4-r7, (rx)
+                                base_addr = regs[rx]
+                                if (base_addr & np.uint32(0xdc000003)) == np.uint32(0x90000000):
+                                    w_idx = (base_addr & np.uint32(0x03ffffff)) >> np.uint32(2)
+                                    r4 = dram_u32[w_idx]
+                                    r5 = dram_u32[w_idx + np.uint32(1)]
+                                    r6 = dram_u32[w_idx + np.uint32(2)]
+                                    r7 = dram_u32[w_idx + np.uint32(3)]
+                                    regs[4] = r4
+                                    regs[5] = r5
+                                    regs[6] = r6
+                                    regs[7] = r7
+                                else:
+                                    r4 = _read32(base_addr, state, dram, dram_u32, mmio_low, mmio_low_u32, mmio_vpu_u32, flash)
+                                    r5 = _read32(np.uint32(base_addr + np.uint32(4)), state, dram, dram_u32, mmio_low, mmio_low_u32, mmio_vpu_u32, flash)
+                                    r6 = _read32(np.uint32(base_addr + np.uint32(8)), state, dram, dram_u32, mmio_low, mmio_low_u32, mmio_vpu_u32, flash)
+                                    r7 = _read32(np.uint32(base_addr + np.uint32(12)), state, dram, dram_u32, mmio_low, mmio_low_u32, mmio_vpu_u32, flash)
+                                    regs[4] = r4
+                                    regs[5] = r5
+                                    regs[6] = r6
+                                    regs[7] = r7
+                            elif ry == 0x5:  # stq r4-r7, (rx)
+                                base_addr = regs[rx]
+                                if (base_addr & np.uint32(0xdc000003)) == np.uint32(0x90000000):
+                                    w_idx = (base_addr & np.uint32(0x03ffffff)) >> np.uint32(2)
+                                    dram_u32[w_idx] = regs[4]
+                                    dram_u32[w_idx + np.uint32(1)] = regs[5]
+                                    dram_u32[w_idx + np.uint32(2)] = regs[6]
+                                    dram_u32[w_idx + np.uint32(3)] = regs[7]
+                                else:
+                                    _write32(base_addr, regs[4], state, dram, dram_u16, dram_u32, mmio_low, mmio_low_u32, mmio_vpu_u32, uart_buf, mmio_log)
+                                    _write32(np.uint32(base_addr + np.uint32(4)), regs[5], state, dram, dram_u16, dram_u32, mmio_low, mmio_low_u32, mmio_vpu_u32, uart_buf, mmio_log)
+                                    _write32(np.uint32(base_addr + np.uint32(8)), regs[6], state, dram, dram_u16, dram_u32, mmio_low, mmio_low_u32, mmio_vpu_u32, uart_buf, mmio_log)
+                                    _write32(np.uint32(base_addr + np.uint32(12)), regs[7], state, dram, dram_u16, dram_u32, mmio_low, mmio_low_u32, mmio_vpu_u32, uart_buf, mmio_log)
+                            elif ry == 0x8:  # dect rx
+                                if c_flag != 0:
+                                    regs[rx] = np.uint32(regs[rx] - np.uint32(1))
+                            elif ry == 0x9:  # decf rx
+                                if c_flag == 0:
+                                    regs[rx] = np.uint32(regs[rx] - np.uint32(1))
+                            elif ry == 0xa:  # inct rx
+                                if c_flag != 0:
+                                    regs[rx] = np.uint32(regs[rx] + np.uint32(1))
+                            elif ry == 0xb:  # incf rx
+                                if c_flag == 0:
+                                    regs[rx] = np.uint32(regs[rx] + np.uint32(1))
+                            elif ry == 0xe:  # ff1 rx
+                                regs[rx] = _ff1_32(regs[rx])
+                            elif ry == 0xf:  # brev rx
+                                regs[rx] = _brev32(regs[rx])
+                        elif rz == 0x1:
+                            v = regs[rx]
+                            if ry == 0x4:  # zextb rx
+                                regs[rx] = np.uint32(v & np.uint32(0xff))
+                            elif ry == 0x6:  # zexth rx
+                                regs[rx] = np.uint32(v & np.uint32(0xffff))
+                            elif ry == 0x5:  # sextb rx
+                                b = np.uint32(v & np.uint32(0xff))
+                                regs[rx] = np.uint32(b | np.uint32(0xffffff00)) if (b & np.uint32(0x80)) != 0 else b
+                            elif ry == 0x7:  # sexth rx
+                                h = np.uint32(v & np.uint32(0xffff))
+                                regs[rx] = np.uint32(h | np.uint32(0xffff0000)) if (h & np.uint32(0x8000)) != 0 else h
+                            elif ry == 0xf:  # not rx
+                                regs[rx] = np.uint32(~v)
+                            elif ry == 0x0:  # xtrb3 r1, rx
+                                regs[1] = np.uint32(v & np.uint32(0xff))
+                            elif ry == 0x1:  # xtrb2 r1, rx
+                                regs[1] = np.uint32((v >> np.uint32(8)) & np.uint32(0xff))
+                            elif ry == 0x2:  # xtrb1 r1, rx
+                                regs[1] = np.uint32((v >> np.uint32(16)) & np.uint32(0xff))
+                            elif ry == 0x3:  # xtrb0 r1, rx
+                                regs[1] = np.uint32((v >> np.uint32(24)) & np.uint32(0xff))
+                            elif ry == 0x8:  # declt rx
+                                v2 = np.uint32(v - np.uint32(1))
+                                regs[rx] = v2
+                                c_flag = np.uint32(1) if (v2 & np.uint32(0x80000000)) != 0 else np.uint32(0)
+                            elif ry == 0x9:  # tstnbz rx
+                                b0 = v & np.uint32(0xff)
+                                b1 = (v >> np.uint32(8)) & np.uint32(0xff)
+                                b2 = (v >> np.uint32(16)) & np.uint32(0xff)
+                                b3 = (v >> np.uint32(24)) & np.uint32(0xff)
+                                c_flag = np.uint32(1) if (b0 != 0 and b1 != 0 and b2 != 0 and b3 != 0) else np.uint32(0)
+                            elif ry == 0xa:  # decgt rx
+                                v2 = np.uint32(v - np.uint32(1))
+                                regs[rx] = v2
+                                c_flag = np.uint32(1) if np.int32(v2) > 0 else np.uint32(0)
+                            elif ry == 0xb:  # decne rx
+                                v2 = np.uint32(v - np.uint32(1))
+                                regs[rx] = v2
+                                c_flag = np.uint32(1) if v2 != 0 else np.uint32(0)
+                            elif ry == 0xc:  # clrt rx
+                                if c_flag != 0:
+                                    regs[rx] = np.uint32(0)
+                            elif ry == 0xd:  # clrf rx
+                                if c_flag == 0:
+                                    regs[rx] = np.uint32(0)
+                            elif ry == 0xe:  # abs rx
+                                if (v & np.uint32(0x80000000)) != 0:
+                                    regs[rx] = np.uint32(np.uint32(0) - v)
+                        elif rz >= 0xc:
+                            if rz == 0xc:  # cmphs rx, ry
+                                c_flag = np.uint32(1) if regs[rx] >= regs[ry] else np.uint32(0)
+                            elif rz == 0xd:  # cmplt rx, ry
+                                c_flag = np.uint32(1) if np.int32(regs[rx]) < np.int32(regs[ry]) else np.uint32(0)
+                            elif rz == 0xe:  # tst rx, ry
+                                c_flag = np.uint32(1) if (regs[rx] & regs[ry]) != 0 else np.uint32(0)
+                            else:  # cmpne rx, ry
+                                c_flag = np.uint32(1) if regs[rx] != regs[ry] else np.uint32(0)
+                        elif rz == 0x5:  # subu rx, ry
+                            regs[rx] = np.uint32(regs[rx] - regs[ry])
+                        elif rz == 0xb:  # lsr rx, ry
+                            sh = np.uint32(regs[ry] & np.uint32(0x3f))
+                            regs[rx] = np.uint32(regs[rx] >> sh) if sh < 32 else np.uint32(0)
+                        elif rz == 0x2:  # movt rx, ry
+                            if c_flag != 0:
+                                regs[rx] = regs[ry]
+                        elif rz == 0xa:  # movf rx, ry
+                            if c_flag == 0:
+                                regs[rx] = regs[ry]
+                        elif rz == 0x3:  # mult rx, ry
+                            prod = np.uint64(regs[rx]) * np.uint64(regs[ry])
+                            regs[rx] = np.uint32(prod & np.uint64(0xffffffff))
+                            lo = np.uint32(prod & np.uint64(0xffffffff))
+                            hi = np.uint32(prod >> np.uint64(32))
+                        elif rz == 0x4:  # mac rx, ry
+                            regs[rx] = np.uint32(regs[rx] + regs[ry] * regs[1])
+                        elif rz == 0x6:  # addc rx, ry
+                            s = np.uint64(regs[rx]) + np.uint64(regs[ry]) + np.uint64(c_flag)
+                            regs[rx] = np.uint32(s & np.uint64(0xffffffff))
+                            c_flag = np.uint32((s >> np.uint64(32)) & np.uint64(1))
+                        elif rz == 0x7:  # subc rx, ry
+                            borrow = np.int64(1) - np.int64(c_flag)
+                            diff = np.int64(regs[rx]) - np.int64(regs[ry]) - borrow
+                            regs[rx] = np.uint32(diff & np.int64(0xffffffff))
+                            c_flag = np.uint32(1) if diff >= 0 else np.uint32(0)
+                    else:  # op == 0x1
+                        if rz == 0x2:  # mov rx, ry
+                            regs[rx] = regs[ry]
+                        elif rz == 0xc:  # addu rx, ry
+                            regs[rx] = np.uint32(regs[rx] + regs[ry])
+                        elif rz == 0x5:  # ixw rx, ry
+                            regs[rx] = np.uint32(regs[rx] + (regs[ry] << np.uint32(2)))
+                        elif rz == 0x6:  # and rx, ry
+                            regs[rx] = np.uint32(regs[rx] & regs[ry])
+                        elif rz == 0xe:  # or rx, ry
+                            regs[rx] = np.uint32(regs[rx] | regs[ry])
+                        elif rz == 0xb:  # lsl rx, ry
+                            sh = np.uint32(regs[ry] & np.uint32(0x3f))
+                            regs[rx] = np.uint32(regs[rx] << sh) if sh < 32 else np.uint32(0)
+                        elif rz == 0xd:  # ixh rx, ry
+                            regs[rx] = np.uint32(regs[rx] + (regs[ry] << np.uint32(1)))
+                        elif rz == 0x7:  # xor rx, ry
+                            regs[rx] = np.uint32(regs[rx] ^ regs[ry])
+                        elif rz == 0xf:  # andn rx, ry
+                            regs[rx] = np.uint32(regs[rx] & (~regs[ry]))
+                        elif rz == 0x4:  # rsub rx, ry
+                            regs[rx] = np.uint32(regs[ry] - regs[rx])
+                        elif rz == 0x3:  # bgenr rx, ry
+                            regs[rx] = np.uint32(np.uint32(1) << (regs[ry] & np.uint32(0x1f)))
+                        elif rz == 0xa:  # asr rx, ry
+                            sh = np.uint32(regs[ry] & np.uint32(0x3f))
+                            if sh >= 32:
+                                regs[rx] = np.uint32(0xffffffff) if (regs[rx] & np.uint32(0x80000000)) != 0 else np.uint32(0)
+                            else:
+                                regs[rx] = np.uint32(np.int32(regs[rx]) >> np.int32(sh))
+                        elif rz == 0x0 or rz == 0x1:
+                            if (inst & 0xfff8) == 0x11f0:  # psrclr imm3
+                                imm3 = np.uint32(inst & 7)
+                                if imm3 == 0:
+                                    cr[0] = np.uint32(cr[0] & ~np.uint32(0x02))
+                                else:
+                                    mask = np.uint32(((imm3 & 1) << 6) | (((imm3 >> 1) & 1) << 4) | (((imm3 >> 2) & 1) << 8))
+                                    cr[0] = np.uint32(cr[0] & ~mask)
+                            elif (inst & 0xfff8) == 0x11f8:  # psrset imm3
+                                imm3 = np.uint32(inst & 7)
+                                if imm3 == 0:
+                                    cr[0] = np.uint32(cr[0] | np.uint32(0x02))
+                                else:
+                                    mask = np.uint32(((imm3 & 1) << 6) | (((imm3 >> 1) & 1) << 4) | (((imm3 >> 2) & 1) << 8))
+                                    cr[0] = np.uint32(cr[0] | mask)
+                            else:  # mfcr rx, cr[imm5]
+                                imm5 = np.uint32((inst >> 4) & 0x1f)
+                                if imm5 == 0:
+                                    cr[0] = np.uint32((cr[0] & np.uint32(0xfffffffe)) | (c_flag & np.uint32(1)))
+                                regs[rx] = cr[imm5]
+                        elif rz == 0x8 or rz == 0x9:  # mtcr rx, cr[imm5]
+                            imm5 = np.uint32((inst >> 4) & 0x1f)
+                            cr[imm5] = regs[rx]
+                            if imm5 == 0:
+                                c_flag = np.uint32(cr[0] & np.uint32(1))
                 else:
-                    regs[rx] = np.uint32(np.int32(regs[rx]) >> np.int32(sh))
-            elif rz == 0xb:  # lsl rx, ry
-                sh = np.uint32(regs[ry] & np.uint32(0x3f))
-                regs[rx] = np.uint32(regs[rx] << sh) if sh < 32 else np.uint32(0)
-            elif rz == 0xc:  # addu rx, ry
-                regs[rx] = np.uint32(regs[rx] + regs[ry])
-            elif rz == 0xd:  # ixh rx, ry
-                regs[rx] = np.uint32(regs[rx] + (regs[ry] << np.uint32(1)))
-            elif rz == 0xe:  # or rx, ry
-                regs[rx] = np.uint32(regs[rx] | regs[ry])
-            elif rz == 0xf:  # andn rx, ry
-                regs[rx] = np.uint32(regs[rx] & (~regs[ry]))
-
-        elif op == 0x2:
-            sub = np.uint32((inst >> 9) & 0x7)
-            imm5 = np.uint32((inst >> 4) & 0x1f)
-            if sub == 0:  # addi rx, oimm5
-                regs[rx] = np.uint32(regs[rx] + imm5 + np.uint32(1))
-            elif sub == 1:  # cmplti rx, oimm5
-                c_flag = np.uint32(1) if np.int32(regs[rx]) < np.int32(imm5 + np.uint32(1)) else np.uint32(0)
-            elif sub == 2:  # subi rx, oimm5
-                regs[rx] = np.uint32(regs[rx] - (imm5 + np.uint32(1)))
-            elif sub == 3:  # cpwgr
-                pass
-            elif sub == 4:  # rsubi rx, imm5
-                regs[rx] = np.uint32(imm5 - regs[rx])
-            elif sub == 5:  # cmpnei rx, imm5
-                c_flag = np.uint32(1) if regs[rx] != imm5 else np.uint32(0)
-            elif sub == 6:
-                if imm5 == 0:  # bmaski rx, 32
-                    regs[rx] = np.uint32(0xffffffff)
-                elif imm5 == 1:  # divu rx, r1
-                    if regs[1] != 0:
-                        regs[rx] = np.uint32(regs[rx] // regs[1])
-                elif imm5 == 2 or imm5 == 6:  # mflos / mflo
-                    regs[rx] = lo
-                elif imm5 == 3 or imm5 == 7:  # mfhis / mfhi
-                    regs[rx] = hi
-                elif imm5 == 4:  # mtlo
-                    lo = regs[rx]
-                elif imm5 == 5:  # mthi
-                    hi = regs[rx]
-                else:  # bmaski rx, imm5
-                    regs[rx] = np.uint32((np.uint32(1) << imm5) - np.uint32(1))
-            elif sub == 7:  # andi rx, imm5
-                regs[rx] = np.uint32(regs[rx] & imm5)
-
-        elif op == 0x3:
-            sub = np.uint32((inst >> 9) & 0x7)
-            imm5 = np.uint32((inst >> 4) & 0x1f)
-            if sub == 0:  # bclri rx, imm5
-                regs[rx] = np.uint32(regs[rx] & ~(np.uint32(1) << imm5))
-            elif sub == 1:
-                if imm5 == 1:  # divs rx, r1
-                    d = np.int64(np.int32(regs[1]))
-                    if d != 0:
-                        n = np.int64(np.int32(regs[rx]))
-                        q = np.int64(n // d)
-                        if (n ^ d) < 0 and (q * d != n):
-                            q += np.int64(1)
-                        regs[rx] = np.uint32(np.int32(q))
-                elif imm5 >= 4:  # bgeni rx, imm5
-                    regs[rx] = np.uint32(np.uint32(1) << imm5)
-            elif sub == 2:  # bseti rx, imm5
-                regs[rx] = np.uint32(regs[rx] | (np.uint32(1) << imm5))
-            elif sub == 3:  # btsti rx, imm5
-                c_flag = np.uint32((regs[rx] >> imm5) & np.uint32(1))
-            elif sub == 4:
-                if imm5 == 0:  # xsr rx
-                    v = regs[rx]
-                    old_c = np.uint32(c_flag & np.uint32(1))
-                    c_flag = np.uint32(v & np.uint32(1))
-                    regs[rx] = np.uint32((v >> np.uint32(1)) | (old_c << np.uint32(31)))
-                else:  # rotli rx, imm5
-                    v = regs[rx]
-                    regs[rx] = np.uint32((v << imm5) | (v >> (np.uint32(32) - imm5)))
-            elif sub == 5:
-                if imm5 == 0:  # asrc rx
-                    v = regs[rx]
-                    c_flag = np.uint32(v & np.uint32(1))
-                    regs[rx] = np.uint32((v >> np.uint32(1)) | (v & np.uint32(0x80000000)))
-                else:  # asri rx, imm5
-                    regs[rx] = np.uint32(np.int32(regs[rx]) >> np.int32(imm5))
-            elif sub == 6:
-                if imm5 == 0:  # lslc rx
-                    v = regs[rx]
-                    c_flag = np.uint32((v >> np.uint32(31)) & np.uint32(1))
-                    regs[rx] = np.uint32(v << np.uint32(1))
-                else:  # lsli rx, imm5
-                    regs[rx] = np.uint32(regs[rx] << imm5)
-            elif sub == 7:
-                if imm5 == 0:  # lsrc rx
-                    v = regs[rx]
-                    c_flag = np.uint32(v & np.uint32(1))
-                    regs[rx] = np.uint32(v >> np.uint32(1))
-                else:  # lsri rx, imm5
-                    regs[rx] = np.uint32(regs[rx] >> imm5)
-
-        elif op == 0x5:
-            if rz == 0x0:  # muls rx, ry
-                prod_s = np.int64(np.int32(regs[rx])) * np.int64(np.int32(regs[ry]))
-                lo = np.uint32(prod_s & np.int64(0xffffffff))
-                hi = np.uint32((prod_s >> np.int64(32)) & np.int64(0xffffffff))
-            elif rz == 0x1:  # mulsa rx, ry
-                acc = (np.int64(np.int32(hi)) << np.int64(32)) | np.int64(np.uint64(lo))
-                acc += np.int64(np.int32(regs[rx])) * np.int64(np.int32(regs[ry]))
-                lo = np.uint32(acc & np.int64(0xffffffff))
-                hi = np.uint32((acc >> np.int64(32)) & np.int64(0xffffffff))
-            elif rz == 0x2:  # mulss rx, ry
-                acc = (np.int64(np.int32(hi)) << np.int64(32)) | np.int64(np.uint64(lo))
-                acc -= np.int64(np.int32(regs[rx])) * np.int64(np.int32(regs[ry]))
-                lo = np.uint32(acc & np.int64(0xffffffff))
-                hi = np.uint32((acc >> np.int64(32)) & np.int64(0xffffffff))
-            elif rz == 0x4:  # mulu rx, ry
-                prod_u = np.uint64(regs[rx]) * np.uint64(regs[ry])
-                lo = np.uint32(prod_u & np.uint64(0xffffffff))
-                hi = np.uint32(prod_u >> np.uint64(32))
-            elif rz == 0x5:  # mulua rx, ry
-                acc_u = (np.uint64(hi) << np.uint64(32)) | np.uint64(lo)
-                acc_u += np.uint64(regs[rx]) * np.uint64(regs[ry])
-                lo = np.uint32(acc_u & np.uint64(0xffffffff))
-                hi = np.uint32(acc_u >> np.uint64(32))
-            elif rz == 0x6:  # mulus rx, ry
-                acc_u = (np.uint64(hi) << np.uint64(32)) | np.uint64(lo)
-                acc_u -= np.uint64(regs[rx]) * np.uint64(regs[ry])
-                lo = np.uint32(acc_u & np.uint64(0xffffffff))
-                hi = np.uint32(acc_u >> np.uint64(32))
-
-        elif op == 0x6:
-            if rz < 8:  # movi rx, imm7
-                imm7 = np.uint32((inst >> 4) & 0x7f)
-                regs[rx] = imm7
-            elif rz == 8:  # mulsh rx, ry
-                p = np.int32(np.int16(regs[rx] & np.uint32(0xffff))) * np.int32(np.int16(regs[ry] & np.uint32(0xffff)))
-                regs[rx] = np.uint32(p)
-                lo = np.uint32(p)
-
-        elif op == 0x7:
-            imm8 = np.uint32(inst & 0xff)
-            pool_addr = np.uint32((pc + np.uint32(2) + (imm8 << np.uint32(2))) & np.uint32(0xfffffffc))
-            if (pool_addr & np.uint32(0xdc000000)) == np.uint32(0x90000000):
-                val = dram_u32[(pool_addr & np.uint32(0x03ffffff)) >> np.uint32(2)]
+                    sub = np.uint32((inst >> 9) & 0x7)
+                    imm5 = np.uint32((inst >> 4) & 0x1f)
+                    if op == 0x2:
+                        if sub == 0:  # addi rx, oimm5
+                            regs[rx] = np.uint32(regs[rx] + imm5 + np.uint32(1))
+                        elif sub == 2:  # subi rx, oimm5
+                            regs[rx] = np.uint32(regs[rx] - (imm5 + np.uint32(1)))
+                        elif sub == 5:  # cmpnei rx, imm5
+                            c_flag = np.uint32(1) if regs[rx] != imm5 else np.uint32(0)
+                        elif sub == 1:  # cmplti rx, oimm5
+                            c_flag = np.uint32(1) if np.int32(regs[rx]) < np.int32(imm5 + np.uint32(1)) else np.uint32(0)
+                        elif sub == 7:  # andi rx, imm5
+                            regs[rx] = np.uint32(regs[rx] & imm5)
+                        elif sub == 6:
+                            if imm5 == 0:  # bmaski rx, 32
+                                regs[rx] = np.uint32(0xffffffff)
+                            elif imm5 == 1:  # divu rx, r1
+                                if regs[1] != 0:
+                                    regs[rx] = np.uint32(regs[rx] // regs[1])
+                            elif imm5 == 2 or imm5 == 6:  # mflos / mflo
+                                regs[rx] = lo
+                            elif imm5 == 3 or imm5 == 7:  # mfhis / mfhi
+                                regs[rx] = hi
+                            elif imm5 == 4:  # mtlo
+                                lo = regs[rx]
+                            elif imm5 == 5:  # mthi
+                                hi = regs[rx]
+                            else:  # bmaski rx, imm5
+                                regs[rx] = np.uint32((np.uint32(1) << imm5) - np.uint32(1))
+                        elif sub == 4:  # rsubi rx, imm5
+                            regs[rx] = np.uint32(imm5 - regs[rx])
+                    else:  # op == 0x3
+                        if sub == 7:
+                            if imm5 == 0:  # lsrc rx
+                                v = regs[rx]
+                                c_flag = np.uint32(v & np.uint32(1))
+                                regs[rx] = np.uint32(v >> np.uint32(1))
+                            else:  # lsri rx, imm5
+                                regs[rx] = np.uint32(regs[rx] >> imm5)
+                        elif sub == 6:
+                            if imm5 == 0:  # lslc rx
+                                v = regs[rx]
+                                c_flag = np.uint32((v >> np.uint32(31)) & np.uint32(1))
+                                regs[rx] = np.uint32(v << np.uint32(1))
+                            else:  # lsli rx, imm5
+                                regs[rx] = np.uint32(regs[rx] << imm5)
+                        elif sub == 3:  # btsti rx, imm5
+                            c_flag = np.uint32((regs[rx] >> imm5) & np.uint32(1))
+                        elif sub == 5:
+                            if imm5 == 0:  # asrc rx
+                                v = regs[rx]
+                                c_flag = np.uint32(v & np.uint32(1))
+                                regs[rx] = np.uint32((v >> np.uint32(1)) | (v & np.uint32(0x80000000)))
+                            else:  # asri rx, imm5
+                                regs[rx] = np.uint32(np.int32(regs[rx]) >> np.int32(imm5))
+                        elif sub == 1:
+                            if imm5 == 1:  # divs rx, r1
+                                d = np.int64(np.int32(regs[1]))
+                                if d != 0:
+                                    n = np.int64(np.int32(regs[rx]))
+                                    q = np.int64(n // d)
+                                    if (n ^ d) < 0 and (q * d != n):
+                                        q += np.int64(1)
+                                    regs[rx] = np.uint32(np.int32(q))
+                            elif imm5 >= 4:  # bgeni rx, imm5
+                                regs[rx] = np.uint32(np.uint32(1) << imm5)
+                        elif sub == 0:  # bclri rx, imm5
+                            regs[rx] = np.uint32(regs[rx] & ~(np.uint32(1) << imm5))
+                        elif sub == 2:  # bseti rx, imm5
+                            regs[rx] = np.uint32(regs[rx] | (np.uint32(1) << imm5))
+                        elif sub == 4:
+                            if imm5 == 0:  # xsr rx
+                                v = regs[rx]
+                                old_c = np.uint32(c_flag & np.uint32(1))
+                                c_flag = np.uint32(v & np.uint32(1))
+                                regs[rx] = np.uint32((v >> np.uint32(1)) | (old_c << np.uint32(31)))
+                            else:  # rotli rx, imm5
+                                v = regs[rx]
+                                regs[rx] = np.uint32((v << imm5) | (v >> (np.uint32(32) - imm5)))
             else:
-                val = _read32(pool_addr, state, dram, dram_u32, mmio_low, mmio_low_u32, mmio_vpu_u32, flash)
-            if rz == 0:  # jmpi
-                next_pc = np.uint32(val & np.uint32(0xfffffffe))
-            elif rz == 15:  # jsri
-                regs[15] = next_pc
-                next_pc = np.uint32(val & np.uint32(0xfffffffe))
-            else:  # lrw rz, [pool_addr]
-                regs[rz] = val
-
-        elif op == 0x8:  # ld.w rz, (rx, imm4*4)
-            addr = np.uint32(regs[rx] + (ry << np.uint32(2)))
-            if (addr & np.uint32(0xdc000003)) == np.uint32(0x90000000):
-                regs[rz] = dram_u32[(addr & np.uint32(0x03ffffff)) >> np.uint32(2)]
+                if op == 0x7:
+                    imm8 = np.uint32(inst & 0xff)
+                    pool_addr = np.uint32((pc + np.uint32(2) + (imm8 << np.uint32(2))) & np.uint32(0xfffffffc))
+                    if (pool_addr & np.uint32(0xdc000000)) == np.uint32(0x90000000):
+                        val = dram_u32[(pool_addr & np.uint32(0x03ffffff)) >> np.uint32(2)]
+                    else:
+                        val = _read32(pool_addr, state, dram, dram_u32, mmio_low, mmio_low_u32, mmio_vpu_u32, flash)
+                    if rz == 15:  # jsri
+                        regs[15] = next_pc
+                        next_pc = np.uint32(val & np.uint32(0xfffffffe))
+                    elif rz == 0:  # jmpi
+                        next_pc = np.uint32(val & np.uint32(0xfffffffe))
+                    else:  # lrw rz, [pool_addr]
+                        regs[rz] = val
+                elif op == 0x6:
+                    if rz < 8:  # movi rx, imm7
+                        regs[rx] = np.uint32((inst >> 4) & 0x7f)
+                    elif rz == 8:  # mulsh rx, ry
+                        p = np.int32(np.int16(regs[rx] & np.uint32(0xffff))) * np.int32(np.int16(regs[ry] & np.uint32(0xffff)))
+                        regs[rx] = np.uint32(p)
+                        lo = np.uint32(p)
+                elif op == 0x5:
+                    if rz == 0x0:  # muls rx, ry
+                        prod_s = np.int64(np.int32(regs[rx])) * np.int64(np.int32(regs[ry]))
+                        lo = np.uint32(prod_s & np.int64(0xffffffff))
+                        hi = np.uint32((prod_s >> np.int64(32)) & np.int64(0xffffffff))
+                    elif rz == 0x1:  # mulsa rx, ry
+                        acc = (np.int64(np.int32(hi)) << np.int64(32)) | np.int64(np.uint64(lo))
+                        acc += np.int64(np.int32(regs[rx])) * np.int64(np.int32(regs[ry]))
+                        lo = np.uint32(acc & np.int64(0xffffffff))
+                        hi = np.uint32((acc >> np.int64(32)) & np.int64(0xffffffff))
+                    elif rz == 0x2:  # mulss rx, ry
+                        acc = (np.int64(np.int32(hi)) << np.int64(32)) | np.int64(np.uint64(lo))
+                        acc -= np.int64(np.int32(regs[rx])) * np.int64(np.int32(regs[ry]))
+                        lo = np.uint32(acc & np.int64(0xffffffff))
+                        hi = np.uint32((acc >> np.int64(32)) & np.int64(0xffffffff))
+                    elif rz == 0x4:  # mulu rx, ry
+                        prod_u = np.uint64(regs[rx]) * np.uint64(regs[ry])
+                        lo = np.uint32(prod_u & np.uint64(0xffffffff))
+                        hi = np.uint32(prod_u >> np.uint64(32))
+                    elif rz == 0x5:  # mulua rx, ry
+                        acc_u = (np.uint64(hi) << np.uint64(32)) | np.uint64(lo)
+                        acc_u += np.uint64(regs[rx]) * np.uint64(regs[ry])
+                        lo = np.uint32(acc_u & np.uint64(0xffffffff))
+                        hi = np.uint32(acc_u >> np.uint64(32))
+                    elif rz == 0x6:  # mulus rx, ry
+                        acc_u = (np.uint64(hi) << np.uint64(32)) | np.uint64(lo)
+                        acc_u -= np.uint64(regs[rx]) * np.uint64(regs[ry])
+                        lo = np.uint32(acc_u & np.uint64(0xffffffff))
+                        hi = np.uint32(acc_u >> np.uint64(32))
+        else:
+            if op < 0xc:
+                if op < 0xa:
+                    addr = np.uint32(regs[rx] + (ry << np.uint32(2)))
+                    if op == 0x8:  # ld.w rz, (rx, imm4*4)
+                        if (addr & np.uint32(0xdc000003)) == np.uint32(0x90000000):
+                            regs[rz] = dram_u32[(addr & np.uint32(0x03ffffff)) >> np.uint32(2)]
+                        else:
+                            regs[rz] = _read32(addr, state, dram, dram_u32, mmio_low, mmio_low_u32, mmio_vpu_u32, flash)
+                    else:  # op == 0x9: st.w rz, (rx, imm4*4)
+                        if (addr & np.uint32(0xdc000003)) == np.uint32(0x90000000):
+                            dram_u32[(addr & np.uint32(0x03ffffff)) >> np.uint32(2)] = regs[rz]
+                        else:
+                            _write32(addr, regs[rz], state, dram, dram_u16, dram_u32, mmio_low, mmio_low_u32, mmio_vpu_u32, uart_buf, mmio_log)
+                else:
+                    addr = np.uint32(regs[rx] + ry)
+                    if op == 0xa:  # ld.b rz, (rx, imm4)
+                        if (addr & np.uint32(0xdc000000)) == np.uint32(0x90000000):
+                            regs[rz] = np.uint32(dram[addr & np.uint32(0x03ffffff)])
+                        else:
+                            regs[rz] = _read8(addr, state, dram, mmio_low, mmio_low_u32, mmio_vpu_u32, flash)
+                    else:  # op == 0xb: st.b rz, (rx, imm4)
+                        if (addr & np.uint32(0xdc000000)) == np.uint32(0x90000000):
+                            dram[addr & np.uint32(0x03ffffff)] = np.uint8(regs[rz] & np.uint32(0xff))
+                        else:
+                            _write8(addr, regs[rz], state, dram, mmio_low, mmio_low_u32, mmio_vpu_u32, uart_buf, mmio_log)
             else:
-                regs[rz] = _read32(addr, state, dram, dram_u32, mmio_low, mmio_low_u32, mmio_vpu_u32, flash)
-        elif op == 0x9:  # st.w rz, (rx, imm4*4)
-            addr = np.uint32(regs[rx] + (ry << np.uint32(2)))
-            if (addr & np.uint32(0xdc000003)) == np.uint32(0x90000000):
-                dram_u32[(addr & np.uint32(0x03ffffff)) >> np.uint32(2)] = regs[rz]
-            else:
-                _write32(addr, regs[rz], state, dram, dram_u32, mmio_low, mmio_low_u32, mmio_vpu_u32, uart_buf, mmio_log)
-        elif op == 0xa:  # ld.b rz, (rx, imm4)
-            addr = np.uint32(regs[rx] + ry)
-            if (addr & np.uint32(0xdc000000)) == np.uint32(0x90000000):
-                regs[rz] = np.uint32(dram[addr & np.uint32(0x03ffffff)])
-            else:
-                regs[rz] = _read8(addr, state, dram, mmio_low, mmio_low_u32, mmio_vpu_u32, flash)
-        elif op == 0xb:  # st.b rz, (rx, imm4)
-            addr = np.uint32(regs[rx] + ry)
-            if (addr & np.uint32(0xdc000000)) == np.uint32(0x90000000):
-                dram[addr & np.uint32(0x03ffffff)] = np.uint8(regs[rz] & np.uint32(0xff))
-            else:
-                _write8(addr, regs[rz], state, dram, mmio_low, mmio_low_u32, mmio_vpu_u32, uart_buf, mmio_log)
-        elif op == 0xc:  # ld.h rz, (rx, imm4*2)
-            addr = np.uint32(regs[rx] + (ry << np.uint32(1)))
-            if (addr & np.uint32(0xdc000001)) == np.uint32(0x90000000):
-                regs[rz] = np.uint32(dram_u16[(addr & np.uint32(0x03ffffff)) >> np.uint32(1)])
-            else:
-                regs[rz] = _read16(addr, state, dram, dram_u16, mmio_low, mmio_low_u16, mmio_low_u32, mmio_vpu_u32, flash)
-        elif op == 0xd:  # st.h rz, (rx, imm4*2)
-            addr = np.uint32(regs[rx] + (ry << np.uint32(1)))
-            if (addr & np.uint32(0xdc000001)) == np.uint32(0x90000000):
-                dram_u16[(addr & np.uint32(0x03ffffff)) >> np.uint32(1)] = np.uint16(regs[rz] & np.uint32(0xffff))
-            else:
-                _write16(addr, regs[rz], state, dram, dram_u16, mmio_low, mmio_low_u16, mmio_low_u32, mmio_vpu_u32, uart_buf, mmio_log)
-
-        elif op == 0xe:  # bt / bf
-            off11 = np.int32(inst & 0x7ff)
-            if (off11 & 0x400) != 0:
-                off11 -= np.int32(0x800)
-            cond = (c_flag == 0) if (inst & 0x0800) != 0 else (c_flag != 0)
-            if cond:
-                next_pc = np.uint32(np.int32(pc) + np.int32(2) + (off11 << np.int32(1)))
-
-        elif op == 0xf:  # br / bsr
-            off11 = np.int32(inst & 0x7ff)
-            if (off11 & 0x400) != 0:
-                off11 -= np.int32(0x800)
-            target = np.uint32(np.int32(pc) + np.int32(2) + (off11 << np.int32(1)))
-            if (inst & 0x0800) != 0:  # bsr
-                regs[15] = next_pc
-            elif off11 == -1 and (cr[0] & 0x40) == 0:
-                state[ST_PC] = pc
-                state[ST_STOP_REASON] = STOP_INFINITE_LOOP
-                break
-            next_pc = target
+                if op < 0xe:
+                    addr = np.uint32(regs[rx] + (ry << np.uint32(1)))
+                    if op == 0xc:  # ld.h rz, (rx, imm4*2)
+                        if (addr & np.uint32(0xdc000001)) == np.uint32(0x90000000):
+                            regs[rz] = np.uint32(dram_u16[(addr & np.uint32(0x03ffffff)) >> np.uint32(1)])
+                        else:
+                            regs[rz] = _read16(addr, state, dram, dram_u16, mmio_low, mmio_low_u16, mmio_low_u32, mmio_vpu_u32, flash)
+                    else:  # op == 0xd: st.h rz, (rx, imm4*2)
+                        if (addr & np.uint32(0xdc000001)) == np.uint32(0x90000000):
+                            dram_u16[(addr & np.uint32(0x03ffffff)) >> np.uint32(1)] = np.uint16(regs[rz] & np.uint32(0xffff))
+                        else:
+                            _write16(addr, regs[rz], state, dram, dram_u16, mmio_low, mmio_low_u16, mmio_low_u32, mmio_vpu_u32, uart_buf, mmio_log)
+                elif op == 0xe:  # bt / bf
+                    off11 = np.int32(inst & 0x7ff)
+                    if (off11 & 0x400) != 0:
+                        off11 -= np.int32(0x800)
+                    cond = (c_flag == 0) if (inst & 0x0800) != 0 else (c_flag != 0)
+                    if cond:
+                        next_pc = np.uint32(np.int32(pc) + np.int32(2) + (off11 << np.int32(1)))
+                else:  # op == 0xf: br / bsr
+                    off11 = np.int32(inst & 0x7ff)
+                    if (off11 & 0x400) != 0:
+                        off11 -= np.int32(0x800)
+                    target = np.uint32(np.int32(pc) + np.int32(2) + (off11 << np.int32(1)))
+                    if (inst & 0x0800) != 0:  # bsr
+                        regs[15] = next_pc
+                    elif off11 == -1 and (cr[0] & 0x40) == 0:
+                        state[ST_PC] = pc
+                        state[ST_STOP_REASON] = STOP_INFINITE_LOOP
+                        break
+                    next_pc = target
 
         hi_pc = next_pc >> np.uint32(16)
         if hi_pc == np.uint32(0x9010):
-            if next_pc == np.uint32(0x90107ec8):
-                next_pc = np.uint32(regs[15] & np.uint32(0xfffffffe))
-            elif next_pc == np.uint32(0x90106b50):  # memset(r2, r3, r4)
-                dst_p = regs[2] & np.uint32(0x1fffffff)
-                n_b = regs[4]
-                if np.uint32(0x10000000) <= dst_p and dst_p + n_b <= np.uint32(0x14000000):
-                    off_d = dst_p - np.uint32(0x10000000)
-                    dram[off_d : off_d + n_b] = np.uint8(regs[3] & np.uint32(0xff))
+            if (next_pc & np.uint32(3)) == np.uint32(0) and (next_pc & np.uint32(0xff)) >= np.uint32(0x50):
+                if next_pc == np.uint32(0x90107ec8):
                     next_pc = np.uint32(regs[15] & np.uint32(0xfffffffe))
-            elif next_pc == np.uint32(0x90106a74):  # memcpy(r2, r3, r4)
-                dst_p = regs[2] & np.uint32(0x1fffffff)
-                src_p = regs[3] & np.uint32(0x1fffffff)
-                n_b = regs[4]
-                if (
-                    np.uint32(0x10000000) <= dst_p
-                    and dst_p + n_b <= np.uint32(0x14000000)
-                    and np.uint32(0x10000000) <= src_p
-                    and src_p + n_b <= np.uint32(0x14000000)
-                ):
-                    off_d = dst_p - np.uint32(0x10000000)
-                    off_s = src_p - np.uint32(0x10000000)
-                    dram[off_d : off_d + n_b] = dram[off_s : off_s + n_b]
-                    next_pc = np.uint32(regs[15] & np.uint32(0xfffffffe))
-            elif insn_count >= np.uint64(8000000) or state[ST_IG_SYNCED] != np.uint64(0):
-                if next_pc == np.uint32(0x90103274):  # hal_lsbit_index(r2)
-                    v_lsb = regs[2]
-                    if v_lsb == 0:
-                        regs[2] = np.uint32(0xffffffff)
-                    else:
-                        regs[2] = np.uint32(31) - _ff1_32(v_lsb & np.uint32(np.uint32(0) - v_lsb))
-                    next_pc = np.uint32(regs[15] & np.uint32(0xfffffffe))
-                elif next_pc == np.uint32(0x9010cb78):  # strcasecmp(r2, r3)
-                    s1_p = (regs[2] & np.uint32(0x1fffffff)) - np.uint32(0x10000000)
-                    s2_p = (regs[3] & np.uint32(0x1fffffff)) - np.uint32(0x10000000)
-                    if s1_p < np.uint32(0x03fff000) and s2_p < np.uint32(0x03fff000):
-                        while True:
-                            c1 = np.uint32(dram[s1_p])
-                            c2 = np.uint32(dram[s2_p])
-                            if 65 <= c1 <= 90:
-                                c1 += np.uint32(32)
-                            if 65 <= c2 <= 90:
-                                c2 += np.uint32(32)
-                            if c1 == 0 or c1 != c2:
-                                regs[2] = np.uint32(c1 - c2)
-                                break
-                            s1_p += np.uint32(1)
-                            s2_p += np.uint32(1)
+                elif next_pc == np.uint32(0x90106b50):  # memset(r2, r3, r4)
+                    dst_p = regs[2] & np.uint32(0x1fffffff)
+                    n_b = regs[4]
+                    if np.uint32(0x10000000) <= dst_p and dst_p + n_b <= np.uint32(0x14000000):
+                        off_d = dst_p - np.uint32(0x10000000)
+                        dram[off_d : off_d + n_b] = np.uint8(regs[3] & np.uint32(0xff))
                         next_pc = np.uint32(regs[15] & np.uint32(0xfffffffe))
-                elif next_pc == np.uint32(0x9010cbc4):  # strncasecmp(r2, r3, r4)
-                    n_cmp = regs[4]
-                    s1_p = (regs[2] & np.uint32(0x1fffffff)) - np.uint32(0x10000000)
-                    s2_p = (regs[3] & np.uint32(0x1fffffff)) - np.uint32(0x10000000)
-                    if s1_p < np.uint32(0x03fff000) and s2_p < np.uint32(0x03fff000):
-                        res_cmp = np.uint32(0)
-                        for _ in range(n_cmp):
-                            c1 = np.uint32(dram[s1_p])
-                            c2 = np.uint32(dram[s2_p])
-                            if 65 <= c1 <= 90:
-                                c1 += np.uint32(32)
-                            if 65 <= c2 <= 90:
-                                c2 += np.uint32(32)
-                            res_cmp = np.uint32(c1 - c2)
-                            if c1 == 0 or c2 == 0 or res_cmp != 0:
-                                break
-                            s1_p += np.uint32(1)
-                            s2_p += np.uint32(1)
-                        regs[2] = res_cmp
+                elif next_pc == np.uint32(0x90106a74):  # memcpy(r2, r3, r4)
+                    dst_p = regs[2] & np.uint32(0x1fffffff)
+                    src_p = regs[3] & np.uint32(0x1fffffff)
+                    n_b = regs[4]
+                    if (
+                        np.uint32(0x10000000) <= dst_p
+                        and dst_p + n_b <= np.uint32(0x14000000)
+                        and np.uint32(0x10000000) <= src_p
+                        and src_p + n_b <= np.uint32(0x14000000)
+                    ):
+                        off_d = dst_p - np.uint32(0x10000000)
+                        off_s = src_p - np.uint32(0x10000000)
+                        dram[off_d : off_d + n_b] = dram[off_s : off_s + n_b]
                         next_pc = np.uint32(regs[15] & np.uint32(0xfffffffe))
-                elif next_pc == np.uint32(0x9010c570) or next_pc == np.uint32(0x9010c5e4):  # strcmp(r2, r3)
-                    s1_p = (regs[2] & np.uint32(0x1fffffff)) - np.uint32(0x10000000)
-                    s2_p = (regs[3] & np.uint32(0x1fffffff)) - np.uint32(0x10000000)
-                    if s1_p < np.uint32(0x03fff000) and s2_p < np.uint32(0x03fff000):
-                        while True:
-                            c1 = np.uint32(dram[s1_p])
-                            c2 = np.uint32(dram[s2_p])
-                            if c1 == 0 or c1 != c2:
-                                regs[2] = np.uint32(c1 - c2)
-                                break
-                            s1_p += np.uint32(1)
-                            s2_p += np.uint32(1)
+                elif insn_count >= np.uint64(8000000) or state[ST_IG_SYNCED] != np.uint64(0):
+                    if next_pc == np.uint32(0x90103274):  # hal_lsbit_index(r2)
+                        v_lsb = regs[2]
+                        if v_lsb == 0:
+                            regs[2] = np.uint32(0xffffffff)
+                        else:
+                            regs[2] = np.uint32(31) - _ff1_32(v_lsb & np.uint32(np.uint32(0) - v_lsb))
                         next_pc = np.uint32(regs[15] & np.uint32(0xfffffffe))
-                elif next_pc == np.uint32(0x9010c690):  # strlen(r2)
-                    s1_p = (regs[2] & np.uint32(0x1fffffff)) - np.uint32(0x10000000)
-                    if s1_p < np.uint32(0x03fff000):
-                        cur_p = s1_p
-                        while dram[cur_p] != 0:
-                            cur_p += np.uint32(1)
-                        regs[2] = np.uint32(cur_p - s1_p)
-                        next_pc = np.uint32(regs[15] & np.uint32(0xfffffffe))
+                    elif next_pc == np.uint32(0x9010cb78):  # strcasecmp(r2, r3)
+                        s1_p = (regs[2] & np.uint32(0x1fffffff)) - np.uint32(0x10000000)
+                        s2_p = (regs[3] & np.uint32(0x1fffffff)) - np.uint32(0x10000000)
+                        if s1_p < np.uint32(0x03fff000) and s2_p < np.uint32(0x03fff000):
+                            while True:
+                                c1 = np.uint32(dram[s1_p])
+                                c2 = np.uint32(dram[s2_p])
+                                if 65 <= c1 <= 90:
+                                    c1 += np.uint32(32)
+                                if 65 <= c2 <= 90:
+                                    c2 += np.uint32(32)
+                                if c1 == 0 or c1 != c2:
+                                    regs[2] = np.uint32(c1 - c2)
+                                    break
+                                s1_p += np.uint32(1)
+                                s2_p += np.uint32(1)
+                            next_pc = np.uint32(regs[15] & np.uint32(0xfffffffe))
+                    elif next_pc == np.uint32(0x9010cbc4):  # strncasecmp(r2, r3, r4)
+                        n_cmp = regs[4]
+                        s1_p = (regs[2] & np.uint32(0x1fffffff)) - np.uint32(0x10000000)
+                        s2_p = (regs[3] & np.uint32(0x1fffffff)) - np.uint32(0x10000000)
+                        if s1_p < np.uint32(0x03fff000) and s2_p < np.uint32(0x03fff000):
+                            res_cmp = np.uint32(0)
+                            for _ in range(n_cmp):
+                                c1 = np.uint32(dram[s1_p])
+                                c2 = np.uint32(dram[s2_p])
+                                if 65 <= c1 <= 90:
+                                    c1 += np.uint32(32)
+                                if 65 <= c2 <= 90:
+                                    c2 += np.uint32(32)
+                                res_cmp = np.uint32(c1 - c2)
+                                if c1 == 0 or c2 == 0 or res_cmp != 0:
+                                    break
+                                s1_p += np.uint32(1)
+                                s2_p += np.uint32(1)
+                            regs[2] = res_cmp
+                            next_pc = np.uint32(regs[15] & np.uint32(0xfffffffe))
+                    elif next_pc == np.uint32(0x9010c570) or next_pc == np.uint32(0x9010c5e4):  # strcmp(r2, r3)
+                        s1_p = (regs[2] & np.uint32(0x1fffffff)) - np.uint32(0x10000000)
+                        s2_p = (regs[3] & np.uint32(0x1fffffff)) - np.uint32(0x10000000)
+                        if s1_p < np.uint32(0x03fff000) and s2_p < np.uint32(0x03fff000):
+                            while True:
+                                c1 = np.uint32(dram[s1_p])
+                                c2 = np.uint32(dram[s2_p])
+                                if c1 == 0 or c1 != c2:
+                                    regs[2] = np.uint32(c1 - c2)
+                                    break
+                                s1_p += np.uint32(1)
+                                s2_p += np.uint32(1)
+                            next_pc = np.uint32(regs[15] & np.uint32(0xfffffffe))
+                    elif next_pc == np.uint32(0x9010c690):  # strlen(r2)
+                        s1_p = (regs[2] & np.uint32(0x1fffffff)) - np.uint32(0x10000000)
+                        if s1_p < np.uint32(0x03fff000):
+                            cur_p = s1_p
+                            while dram[cur_p] != 0:
+                                cur_p += np.uint32(1)
+                            regs[2] = np.uint32(cur_p - s1_p)
+                            next_pc = np.uint32(regs[15] & np.uint32(0xfffffffe))
         elif hi_pc == np.uint32(0x901c):
             if state[ST_KEY_CODE] != 0:
                 if next_pc == np.uint32(0x901c2e62):  # Main GUI loop event poll entry
@@ -1416,7 +1468,7 @@ def run_cpu(
                 elif state[ST_IG_SYNCED] == np.uint64(10):
                     state[ST_IG_SYNCED] = np.uint64(11)
                 else:
-                    if state[ST_IG_SYNCED] == np.uint64(11):
+                    if (state[ST_IG_SYNCED] == np.uint64(11) or state[ST_IG_SYNCED] == np.uint64(1)) and state[ST_KEY_CODE] == np.uint64(0):
                         state[ST_KEY_CODE] = np.uint64(1) << np.uint64(63)
                     state[ST_IG_SYNCED] = np.uint64(2)
                     regs[2] = np.uint32(0)
@@ -1445,6 +1497,7 @@ def run_cpu(
         state[ST_STOP_REASON] = STOP_MAX_STEPS
 
     cr[0] = np.uint32((cr[0] & np.uint32(0xfffffffe)) | (c_flag & np.uint32(1)))
+    state[ST_LAST_PC] = pc
     state[ST_PC] = pc
     state[ST_HI] = hi
     state[ST_LO] = lo
@@ -1541,12 +1594,31 @@ class GX6706Emulator:
 
     MAIN_MENU_TABS = ("Program", "Picture", "Search", "Time", "Option", "System", "USB")
 
+    _FLASH_CACHE = {}
+    _ECOS_CACHE = {}
+    _RGB565_LUT = None
+    _RGB565_LUT_BLACK = None
+
+    @classmethod
+    def _ensure_rgb565_luts(cls):
+        if cls._RGB565_LUT is None:
+            idx = np.arange(65536, dtype=np.uint32)
+            r = (((idx >> 11) & 0x1f) * 255 // 31).astype(np.uint8)
+            g = (((idx >> 5) & 0x3f) * 255 // 63).astype(np.uint8)
+            b = ((idx & 0x1f) * 255 // 31).astype(np.uint8)
+            cls._RGB565_LUT = np.stack([r, g, b], axis=-1)
+            cls._RGB565_LUT_BLACK = cls._RGB565_LUT.copy()
+            cls._RGB565_LUT_BLACK[0x8df7] = 0
+
     def __init__(self, flash_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), "ZenWire_DVB-T2-001-GX6706_4mb.bin")):
         self.flash_path = flash_path
         if os.path.exists(flash_path):
-            with open(flash_path, "rb") as f:
-                flash_bytes = f.read()
-            self.flash = np.frombuffer(flash_bytes, dtype=np.uint8).copy()
+            cached = self._FLASH_CACHE.get(flash_path)
+            if cached is None:
+                with open(flash_path, "rb") as f:
+                    cached = np.frombuffer(f.read(), dtype=np.uint8).copy()
+                self._FLASH_CACHE[flash_path] = cached
+            self.flash = cached.copy()
         else:
             self.flash = np.zeros(4 * 1024 * 1024, dtype=np.uint8)
 
@@ -1567,15 +1639,22 @@ class GX6706Emulator:
 
         self.uart_buf = np.zeros(256 * 1024, dtype=np.uint8)
         self.mmio_log = np.zeros((16384, 3), dtype=np.uint32)
+        self._dirty = False
 
         self.reset()
 
     def reset(self):
-        self.regs.fill(0)
-        self.cr.fill(0)
-        self.state.fill(0)
-        self.mmio_low.fill(0)
-        self.mmio_vpu.fill(0)
+        if self._dirty:
+            self.regs.fill(0)
+            self.cr.fill(0)
+            self.state.fill(0)
+            self.mmio_low.fill(0)
+            self.mmio_vpu.fill(0)
+            self._dirty = False
+        else:
+            self.regs.fill(0)
+            self.cr.fill(0)
+            self.state.fill(0)
 
         # Supervisor mode (S=1) in PSR (cr0)
         self.cr[0] = 0x80000000
@@ -1598,8 +1677,7 @@ class GX6706Emulator:
         self.mmio_low_u32[0x00500050 >> 2] = 0xffffffff
         self.mmio_low_u32[0x00500054 >> 2] = 0xffffffff
         # Default 1-to-1 INTC channel mapping
-        for i in range(64):
-            self.mmio_low[0x00500060 + i] = i
+        self.mmio_low[0x00500060:0x005000a0] = np.arange(64, dtype=np.uint8)
         # 8. USB OHCI0 (0x00900000), OHCI1 (0x00901000), EHCI (0x00904000) defaults
         for ohci_base in (0x00900000, 0x00901000):
             self.mmio_low_u32[(ohci_base + 0x00) >> 2] = 0x00000110  # HcRevision
@@ -1622,8 +1700,14 @@ class GX6706Emulator:
         """Fast-boot helper: load decompressed ecos.bin directly at 0x90000000 with GxLoader ATAG bootargs."""
         self.reset()
         if ecos_bin is None:
-            ecos_bin = lzma.decompress(bytes(self.flash[0x30080:0x30080 + 2304104]))
-        self.dram[:len(ecos_bin)] = np.frombuffer(ecos_bin, dtype=np.uint8)
+            ecos_arr = self._ECOS_CACHE.get(self.flash_path)
+            if ecos_arr is None:
+                raw = lzma.decompress(bytes(self.flash[0x30080:0x30080 + 2304104]))
+                ecos_arr = np.frombuffer(raw, dtype=np.uint8).copy()
+                self._ECOS_CACHE[self.flash_path] = ecos_arr
+            self.dram[:len(ecos_arr)] = ecos_arr
+        else:
+            self.dram[:len(ecos_bin)] = np.frombuffer(ecos_bin, dtype=np.uint8)
         # Write 8-byte ATAG header + bootargs string into DRAM at 0x93186318 (exact layout GxLoader builds)
         atag_bootargs = (
             b"\x00\x02\x00\x00\x03\x00AT"
@@ -1646,6 +1730,7 @@ class GX6706Emulator:
         self.state[ST_PC] = 0x90000000
 
     def step(self, max_steps=100000, stop_on_stage_transition=False):
+        self._dirty = True
         start_insns = int(self.state[ST_INSN_COUNT])
         while True:
             elapsed = int(self.state[ST_INSN_COUNT]) - start_insns
@@ -1782,18 +1867,14 @@ class GX6706Emulator:
 
     def render_osd(self, output_path: str = None, transparent_to_black: bool = False) -> np.ndarray:
         """Decode the active 16bpp RGB565 OSD framebuffer to an (H, W, 3) uint8 RGB image."""
+        self._ensure_rgb565_luts()
         info = self.get_osd_region_info()
         w = info["width"]
         h = info["height"]
         fb_off = (info["fb_phys"] & 0x03ffffff) >> 1
         fb16 = self.dram_u16[fb_off : fb_off + w * h].reshape((h, w))
-        r = (((fb16 >> 11) & 0x1f).astype(np.uint32) * 255 // 31).astype(np.uint8)
-        g = (((fb16 >> 5) & 0x3f).astype(np.uint32) * 255 // 63).astype(np.uint8)
-        b = ((fb16 & 0x1f).astype(np.uint32) * 255 // 31).astype(np.uint8)
-        rgb = np.stack([r, g, b], axis=-1)
-        if transparent_to_black:
-            mask = fb16 == 0x8df7
-            rgb[mask] = 0
+        lut = self._RGB565_LUT_BLACK if transparent_to_black else self._RGB565_LUT
+        rgb = lut[fb16]
         if output_path is not None:
             from PIL import Image
             Image.fromarray(rgb).save(output_path)
@@ -1834,12 +1915,13 @@ class GX6706Emulator:
                 return STOP_MAX_STEPS
             res = self.step(max_steps=rem)
             if self.state[ST_KEY_CODE] == 0:
-                info = self.get_osd_region_info()
-                fb_off = (info["fb_phys"] & 0x03ffffff) >> 1
-                fb_cur = self.dram_u16[fb_off : fb_off + info["width"] * info["height"]]
-                non_bg_px = int(np.count_nonzero((fb_cur != 0) & (fb_cur != 0x8df7)))
-                if self.get_vpu_flip_count() > flips_before and non_bg_px >= 1000:
-                    return res
+                if self.get_vpu_flip_count() > flips_before:
+                    info = self.get_osd_region_info()
+                    fb_off = (info["fb_phys"] & 0x03ffffff) >> 1
+                    fb_cur = self.dram_u16[fb_off : fb_off + info["width"] * info["height"]]
+                    non_bg_px = int(np.count_nonzero((fb_cur != 0) & (fb_cur != 0x8df7)))
+                    if non_bg_px >= 1000:
+                        return res
                 # Advance one more GUI event loop iteration if a non-blank frame hasn't flipped yet
                 self.state[ST_KEY_CODE] = np.uint64(1) << np.uint64(63)
             elif res != STOP_RUNNING:
